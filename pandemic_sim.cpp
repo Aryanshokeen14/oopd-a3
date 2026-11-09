@@ -1,3 +1,13 @@
+#include <thread>
+#include <future>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
+#include <memory>
+#include <type_traits>
+#include <stdexcept>
+#include <utility>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -54,7 +64,102 @@ struct Params {
     int io_latency_ms = 0;      // --io-latency in ms
     bool fixed_days = false;    // Whether to force running fixed number of days
     std::string output_file = "output.csv"; // CSV output path
+    bool use_thread_pool = false;
 };
+
+
+class ThreadPool {
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+
+    std::mutex queueMutex;
+    std::condition_variable condition;
+    bool stopping = false;
+
+public:
+    explicit ThreadPool(size_t threadCount) {
+        if (threadCount == 0) {
+            throw std::invalid_argument("Thread count must be positive");
+        }
+
+        for (size_t i = 0; i < threadCount; ++i) {
+
+            workers.emplace_back([this]() {
+
+                while (true) {
+                    std::function<void()> task;
+
+                    {
+                        std::unique_lock<std::mutex> lock(queueMutex);
+
+                        condition.wait(lock, [this]() {
+                            return stopping || !tasks.empty();
+                        });
+
+                        if (stopping && tasks.empty()) {
+                            return;
+                        }
+
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                    }
+
+                    task();
+                }
+            });
+        }
+    }
+
+    template <typename F>
+    auto submit(F&& function)
+        -> std::future<std::invoke_result_t<F>> {
+
+        using ReturnType = std::invoke_result_t<F>;
+
+        auto task = std::make_shared<
+            std::packaged_task<ReturnType()>
+        >(std::forward<F>(function));
+
+        std::future<ReturnType> result = task->get_future();
+
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+
+            if (stopping) {
+                throw std::runtime_error("Thread pool is stopping");
+            }
+
+            tasks.emplace([task]() {
+                (*task)();
+            });
+        }
+
+        condition.notify_one();
+
+        return result;
+    }
+
+    ~ThreadPool() {
+
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            stopping = true;
+        }
+
+        condition.notify_all();
+
+        for (auto& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+    ThreadPool(const ThreadPool&) = delete;
+    ThreadPool& operator=(const ThreadPool&) = delete;
+};
+
 
 // High-quality hash-based PRNG returning uniform double in [0, 1)
 // Function of (seed, day, cell, stream) as specified in Section 3.1
@@ -89,6 +194,93 @@ uint64_t computeGridChecksum(const std::vector<Cell>& grid) {
     return hash;
 }
 
+
+Counts updateChunk(
+    const std::vector<Cell>& cur,
+    std::vector<Cell>& next,
+    int startRow,
+    int endRow,
+    int N,
+    int day,
+    const double P[9],
+    const Params& p
+) {
+    Counts localCounts;
+
+    const int di[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
+    const int dj[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
+
+    for (int i = startRow; i < endRow; ++i) {
+        for (int j = 0; j < N; ++j) {
+
+            long long id = static_cast<long long>(i) * N + j;
+            const Cell& cell = cur[id];
+
+            if (cell.state == STATE_S) {
+
+                int k = 0;
+
+                for (int dir = 0; dir < 8; ++dir) {
+                    int ni = i + di[dir];
+                    int nj = j + dj[dir];
+
+                    if (ni >= 0 && ni < N &&
+                        nj >= 0 && nj < N) {
+
+                        if (cur[static_cast<long long>(ni) * N + nj].state == STATE_I) {
+                            k++;
+                        }
+                    }
+                }
+
+                if (k > 0 &&
+                    rand01(p.seed, day, id, 0) < P[k]) {
+
+                    next[id] = {STATE_I, 0};
+                    localCounts.I++;
+
+                } else {
+
+                    next[id] = {STATE_S, 0};
+                    localCounts.S++;
+                }
+
+            } else if (cell.state == STATE_I) {
+
+                if (cell.c + 1 == p.d) {
+
+                    if (rand01(p.seed, day, id, 1) < p.mu) {
+                        next[id] = {STATE_D, 0};
+                        localCounts.D++;
+                    } else {
+                        next[id] = {STATE_R, 0};
+                        localCounts.R++;
+                    }
+
+                } else {
+
+                    next[id] = {
+                        STATE_I,
+                        static_cast<uint8_t>(cell.c + 1)
+                    };
+
+                    localCounts.I++;
+                }
+
+            } else {
+
+                next[id] = cell;
+
+                if (cell.state == STATE_R) localCounts.R++;
+                else if (cell.state == STATE_V) localCounts.V++;
+                else if (cell.state == STATE_D) localCounts.D++;
+            }
+        }
+    }
+
+    return localCounts;
+}
+
 void printHelp(const char* prog) {
     std::cout << "Usage: " << prog << " [options]\n"
               << "Options:\n"
@@ -111,7 +303,8 @@ void printHelp(const char* prog) {
               << "  --io-latency <int>            Simulated I/O latency in ms (default: 0)\n"
               << "  --fixed-days                  Simulate exact number of days even if I reaches 0\n"
               << "  -o, --output <file>           Output CSV filename (default: output.csv)\n"
-              << "  -h, --help                    Show this help message\n";
+              << "  -h, --help                    Show this help message\n"
+              << "  --pool                       Use reusable thread pool\n";
 }
 
 Params parseArgs(int argc, char* argv[]) {
@@ -159,6 +352,8 @@ Params parseArgs(int argc, char* argv[]) {
         } else if (arg == "-h" || arg == "--help") {
             printHelp(argv[0]);
             std::exit(0);
+        } else if (arg == "--pool") {
+            p.use_thread_pool = true;
         } else {
             std::cerr << "Warning: Unknown option " << arg << "\n";
         }
@@ -246,8 +441,12 @@ int main(int argc, char* argv[]) {
 
     // Precompute P[k] table for current beta_eff
     // Moore neighborhood offsets
-    const int di[8] = {-1, -1, -1,  0, 0,  1, 1, 1};
-    const int dj[8] = {-1,  0,  1, -1, 1, -1, 0, 1};
+
+    std::unique_ptr<ThreadPool> pool;
+
+    if (p.use_thread_pool) {
+        pool = std::make_unique<ThreadPool>(p.num_threads);
+    }
 
     // Main simulation loop
     for (int day = 0; day < p.max_days; ++day) {
@@ -280,54 +479,53 @@ int main(int argc, char* argv[]) {
         // Reset next counts
         Counts next_counts;
 
-        // 2. Cell update step (Single-threaded / sequential)
-        for (int i = 0; i < N; ++i) {
-            for (int j = 0; j < N; ++j) {
-                long long id = static_cast<long long>(i) * N + j;
-                const Cell& cell = cur[id];
+        
+// B1: Thread per day
+int C = std::max(1, p.num_chunks);
+C = std::min(C, N);
 
-                if (cell.state == STATE_S) {
-                    // Count infected neighbors in cur
-                    int k = 0;
-                    for (int dir = 0; dir < 8; ++dir) {
-                        int ni = i + di[dir];
-                        int nj = j + dj[dir];
-                        if (ni >= 0 && ni < N && nj >= 0 && nj < N) {
-                            if (cur[static_cast<long long>(ni) * N + nj].state == STATE_I) {
-                                k++;
-                            }
-                        }
-                    }
+std::vector<std::thread> workers;
+std::vector<Counts> threadCounts(C);
 
-                    if (k > 0 && rand01(p.seed, day, id, 0) < P[k]) {
-                        next[id] = {STATE_I, 0};
-                        next_counts.I++;
-                    } else {
-                        next[id] = {STATE_S, 0};
-                        next_counts.S++;
-                    }
-                } else if (cell.state == STATE_I) {
-                    if (cell.c + 1 == p.d) {
-                        if (rand01(p.seed, day, id, 1) < p.mu) {
-                            next[id] = {STATE_D, 0};
-                            next_counts.D++;
-                        } else {
-                            next[id] = {STATE_R, 0};
-                            next_counts.R++;
-                        }
-                    } else {
-                        next[id] = {STATE_I, static_cast<uint8_t>(cell.c + 1)};
-                        next_counts.I++;
-                    }
-                } else {
-                    // R, V, D states never change
-                    next[id] = cell;
-                    if (cell.state == STATE_R) next_counts.R++;
-                    else if (cell.state == STATE_V) next_counts.V++;
-                    else if (cell.state == STATE_D) next_counts.D++;
-                }
-            }
+int rowsPerChunk = N / C;
+int extraRows = N % C;
+
+int startRow = 0;
+
+for (int chunk = 0; chunk < C; ++chunk) {
+
+    int rows = rowsPerChunk + (chunk < extraRows ? 1 : 0);
+    int endRow = startRow + rows;
+
+    workers.emplace_back(
+        [&, chunk, startRow, endRow]() {
+            threadCounts[chunk] = updateChunk(
+                cur, next,
+                startRow, endRow,
+                N, day, P, p
+            );
         }
+    );
+
+    startRow = endRow;
+}
+
+// Wait for every thread
+for (auto& worker : workers) {
+    worker.join();
+}
+
+// Combine local counts
+next_counts = Counts{};
+
+for (const auto& local : threadCounts) {
+    next_counts.S += local.S;
+    next_counts.I += local.I;
+    next_counts.R += local.R;
+    next_counts.V += local.V;
+    next_counts.D += local.D;
+}
+
 
         // Swap grids
         std::swap(cur, next);
