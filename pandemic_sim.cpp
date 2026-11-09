@@ -480,52 +480,91 @@ int main(int argc, char* argv[]) {
         Counts next_counts;
 
         
-// B1: Thread per day
 int C = std::max(1, p.num_chunks);
 C = std::min(C, N);
-
-std::vector<std::thread> workers;
-std::vector<Counts> threadCounts(C);
 
 int rowsPerChunk = N / C;
 int extraRows = N % C;
 
-int startRow = 0;
-
-for (int chunk = 0; chunk < C; ++chunk) {
-
-    int rows = rowsPerChunk + (chunk < extraRows ? 1 : 0);
-    int endRow = startRow + rows;
-
-    workers.emplace_back(
-        [&, chunk, startRow, endRow]() {
-            threadCounts[chunk] = updateChunk(
-                cur, next,
-                startRow, endRow,
-                N, day, P, p
-            );
-        }
-    );
-
-    startRow = endRow;
-}
-
-// Wait for every thread
-for (auto& worker : workers) {
-    worker.join();
-}
-
-// Combine local counts
 next_counts = Counts{};
 
-for (const auto& local : threadCounts) {
-    next_counts.S += local.S;
-    next_counts.I += local.I;
-    next_counts.R += local.R;
-    next_counts.V += local.V;
-    next_counts.D += local.D;
-}
+if (pool) {
 
+    // B2: Thread pool
+    std::vector<std::future<Counts>> futures;
+    futures.reserve(C);
+
+    int startRow = 0;
+
+    for (int chunk = 0; chunk < C; ++chunk) {
+
+        int rows = rowsPerChunk + (chunk < extraRows ? 1 : 0);
+        int endRow = startRow + rows;
+
+        futures.emplace_back(
+            pool->submit(
+                [&, startRow, endRow]() {
+                    return updateChunk(
+                        cur, next,
+                        startRow, endRow,
+                        N, day, P, p
+                    );
+                }
+            )
+        );
+
+        startRow = endRow;
+    }
+
+    // Wait for all tasks and collect their results
+    for (auto& future : futures) {
+        Counts local = future.get();
+
+        next_counts.S += local.S;
+        next_counts.I += local.I;
+        next_counts.R += local.R;
+        next_counts.V += local.V;
+        next_counts.D += local.D;
+    }
+
+} else {
+
+    // B1: Thread per day
+    std::vector<std::thread> workers;
+    std::vector<Counts> threadCounts(C);
+
+    int startRow = 0;
+
+    for (int chunk = 0; chunk < C; ++chunk) {
+
+        int rows = rowsPerChunk + (chunk < extraRows ? 1 : 0);
+        int endRow = startRow + rows;
+
+        workers.emplace_back(
+            [&, chunk, startRow, endRow]() {
+                threadCounts[chunk] = updateChunk(
+                    cur, next,
+                    startRow, endRow,
+                    N, day, P, p
+                );
+            }
+        );
+
+        startRow = endRow;
+    }
+
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    for (const auto& local : threadCounts) {
+        next_counts.S += local.S;
+        next_counts.I += local.I;
+        next_counts.R += local.R;
+        next_counts.V += local.V;
+        next_counts.D += local.D;
+    }
+}
 
         // Swap grids
         std::swap(cur, next);
