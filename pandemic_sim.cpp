@@ -72,6 +72,7 @@ struct Params {
     bool fixed_days = false;    // Whether to force running fixed number of days
     std::string output_file = "output.csv"; // CSV output path
     bool use_thread_pool = false;
+    std::string partition = "strips";
 };
 
 
@@ -323,7 +324,8 @@ void printHelp(const char* prog) {
               << "  --fixed-days                  Simulate exact number of days even if I reaches 0\n"
               << "  -o, --output <file>           Output CSV filename (default: output.csv)\n"
               << "  -h, --help                    Show this help message\n"
-              << "  --pool                       Use reusable thread pool\n";
+              << "  --pool                       Use reusable thread pool\n"
+              << "  --partition <type>    strips or blocks\n";
 }
 
 Params parseArgs(int argc, char* argv[]) {
@@ -373,6 +375,8 @@ Params parseArgs(int argc, char* argv[]) {
             std::exit(0);
         } else if (arg == "--pool") {
             p.use_thread_pool = true;
+        } else if (arg == "--partition" && i + 1 < argc) {
+            p.partition = argv[++i];
         } else {
             std::cerr << "Warning: Unknown option " << arg << "\n";
         }
@@ -498,44 +502,101 @@ int main(int argc, char* argv[]) {
         // Reset next counts
         Counts next_counts;
 
-        
+
 int C = std::max(1, p.num_chunks);
 C = std::min(C, N);
 
-int rowsPerChunk = N / C;
-int extraRows = N % C;
+std::vector<Region> regions;
+regions.reserve(C);
 
+if (p.partition == "strips") {
+
+    // B3.1: Row strips
+    int rowsPerChunk = N / C;
+    int extraRows = N % C;
+    int startRow = 0;
+
+    for (int chunk = 0; chunk < C; ++chunk) {
+        int rows = rowsPerChunk +
+                   (chunk < extraRows ? 1 : 0);
+
+        int endRow = startRow + rows;
+
+        regions.push_back({startRow, endRow, 0, N});
+
+        startRow = endRow;
+    }
+
+} else if (p.partition == "blocks") {
+
+    // B3.2: Approximately square blocks
+    int tileRows = static_cast<int>(std::ceil(std::sqrt(C)));
+
+    int baseBlocks = C / tileRows;
+    int extraBlocks = C % tileRows;
+
+    int rowStart = 0;
+
+    for (int r = 0; r < tileRows; ++r) {
+
+        int rows = N / tileRows +
+                   (r < N % tileRows ? 1 : 0);
+
+        int rowEnd = rowStart + rows;
+
+        int blocksInRow = baseBlocks +
+                          (r < extraBlocks ? 1 : 0);
+
+        int colStart = 0;
+
+        for (int c = 0; c < blocksInRow; ++c) {
+
+            int cols = N / blocksInRow +
+                       (c < N % blocksInRow ? 1 : 0);
+
+            int colEnd = colStart + cols;
+
+            regions.push_back({
+                rowStart, rowEnd,
+                colStart, colEnd
+            });
+
+            colStart = colEnd;
+        }
+
+        rowStart = rowEnd;
+    }
+
+} else {
+    throw std::invalid_argument(
+        "Unknown partition. Use strips or blocks."
+    );
+}
+
+
+// Execute generated regions
 next_counts = Counts{};
 
 if (pool) {
 
     // B2: Thread pool
     std::vector<std::future<Counts>> futures;
-    futures.reserve(C);
+    futures.reserve(regions.size());
 
-    int startRow = 0;
-
-    for (int chunk = 0; chunk < C; ++chunk) {
-
-        int rows = rowsPerChunk + (chunk < extraRows ? 1 : 0);
-        int endRow = startRow + rows;
+    for (size_t chunk = 0; chunk < regions.size(); ++chunk) {
 
         futures.emplace_back(
             pool->submit(
-                [&, startRow, endRow]() {
-                    return updateChunk(
-                        cur, next,
-                        startRow, endRow,
+                [&, chunk]() {
+                    return updateRegion(
+                        cur, next, regions[chunk],
                         N, day, P, p
                     );
                 }
             )
         );
-
-        startRow = endRow;
     }
 
-    // Wait for all tasks and collect their results
     for (auto& future : futures) {
         Counts local = future.get();
 
@@ -550,26 +611,18 @@ if (pool) {
 
     // B1: Thread per day
     std::vector<std::thread> workers;
-    std::vector<Counts> threadCounts(C);
+    std::vector<Counts> threadCounts(regions.size());
 
-    int startRow = 0;
-
-    for (int chunk = 0; chunk < C; ++chunk) {
-
-        int rows = rowsPerChunk + (chunk < extraRows ? 1 : 0);
-        int endRow = startRow + rows;
+    for (size_t chunk = 0; chunk < regions.size(); ++chunk) {
 
         workers.emplace_back(
-            [&, chunk, startRow, endRow]() {
-                threadCounts[chunk] = updateChunk(
-                    cur, next,
-                    startRow, endRow,
+            [&, chunk]() {
+                threadCounts[chunk] = updateRegion(
+                    cur, next, regions[chunk],
                     N, day, P, p
                 );
             }
         );
-
-        startRow = endRow;
     }
 
     for (auto& worker : workers) {
@@ -584,6 +637,7 @@ if (pool) {
         next_counts.D += local.D;
     }
 }
+        
 
         // Swap grids
         std::swap(cur, next);
