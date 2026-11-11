@@ -20,6 +20,9 @@
 #include <numeric>
 #include <algorithm>
 #include <random>
+#include <chrono>
+#include <deque>
+#include <filesystem>
 
 // State definitions: S, I, R, V, D
 enum State : uint8_t {
@@ -74,6 +77,8 @@ struct Params {
     std::string output_file = "output.csv"; // CSV output path
     bool use_thread_pool = false;
     std::string partition = "strips";
+    bool async_snapshots = false;
+    std::string snapshot_prefix = "results/part_c/snapshot";
 };
 
 
@@ -304,6 +309,97 @@ Counts updateChunk(
     );
 }
 
+
+std::string snapshotFilename(const std::string& prefix, int day) {
+    std::ostringstream filename;
+    filename << prefix << "_day_"
+             << std::setw(4) << std::setfill('0')
+             << day << ".ppm";
+    return filename.str();
+}
+
+bool writePPM(
+    const std::vector<Cell>& grid,
+    int N,
+    const std::string& filename,
+    int latencyMs
+) {
+    try {
+        std::filesystem::path outputPath(filename);
+
+        if (!outputPath.parent_path().empty()) {
+            std::filesystem::create_directories(
+                outputPath.parent_path()
+            );
+        }
+
+        if (latencyMs > 0) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(latencyMs)
+            );
+        }
+
+        std::ofstream out(filename, std::ios::binary);
+
+        if (!out.is_open()) {
+            return false;
+        }
+
+        out << "P6\n" << N << " " << N << "\n255\n";
+
+        for (const auto& cell : grid) {
+            unsigned char rgb[3];
+
+            switch (cell.state) {
+                case STATE_S:
+                    rgb[0] = 245;
+                    rgb[1] = 245;
+                    rgb[2] = 245;
+                    break;
+
+                case STATE_I:
+                    rgb[0] = 220;
+                    rgb[1] = 40;
+                    rgb[2] = 40;
+                    break;
+
+                case STATE_R:
+                    rgb[0] = 40;
+                    rgb[1] = 180;
+                    rgb[2] = 80;
+                    break;
+
+                case STATE_V:
+                    rgb[0] = 40;
+                    rgb[1] = 100;
+                    rgb[2] = 220;
+                    break;
+
+                case STATE_D:
+                default:
+                    rgb[0] = 0;
+                    rgb[1] = 0;
+                    rgb[2] = 0;
+                    break;
+            }
+
+            out.write(
+                reinterpret_cast<const char*>(rgb), 3
+            );
+        }
+
+        out.flush();
+        bool success = out.good();
+        out.close();
+
+        return success && !out.fail();
+
+    } catch (...) {
+        return false;
+    }
+}
+
+
 void printHelp(const char* prog) {
     std::cout << "Usage: " << prog << " [options]\n"
               << "Options:\n"
@@ -324,6 +420,8 @@ void printHelp(const char* prog) {
               << "  -K, --snapshot-interval <int> Snapshot interval in days (default: 0)\n"
               << "  -Q, --snapshot-limit <int>    Max pending snapshot writes (default: 4)\n"
               << "  --io-latency <int>            Simulated I/O latency in ms (default: 0)\n"
+              << "  --async-snapshots             Enable asynchronous snapshots\n"
+              << "  --snapshot-prefix <path>      Snapshot filename prefix\n"
               << "  --fixed-days                  Simulate exact number of days even if I reaches 0\n"
               << "  -o, --output <file>           Output CSV filename (default: output.csv)\n"
               << "  -h, --help                    Show this help message\n"
@@ -369,6 +467,10 @@ Params parseArgs(int argc, char* argv[]) {
             p.snapshot_limit = std::stoi(argv[++i]);
         } else if (arg == "--io-latency" && i + 1 < argc) {
             p.io_latency_ms = std::stoi(argv[++i]);
+        } else if (arg == "--async-snapshots") {
+            p.async_snapshots = true;
+        } else if (arg == "--snapshot-prefix" && i + 1 < argc) {
+    p.snapshot_prefix = argv[++i];
         } else if (arg == "--fixed-days") {
             p.fixed_days = true;
         } else if ((arg == "-o" || arg == "--output") && i + 1 < argc) {
@@ -389,6 +491,13 @@ Params parseArgs(int argc, char* argv[]) {
 
 int main(int argc, char* argv[]) {
     Params p = parseArgs(argc, argv);
+    if (p.snapshot_interval < 0 || p.io_latency_ms < 0 ||
+    (p.async_snapshots && p.snapshot_interval > 0 &&
+     p.snapshot_limit <= 0)) {
+
+    std::cerr << "Invalid snapshot parameters\n";
+    return 1;
+}
 
     const int N = p.N;
     const long long total_cells = static_cast<long long>(N) * N;
@@ -469,6 +578,7 @@ int main(int argc, char* argv[]) {
     // Moore neighborhood offsets
 
     std::unique_ptr<ThreadPool> pool;
+    std::deque<std::pair<int, std::future<bool>>> pendingSnapshots;
 
     if (p.use_thread_pool) {
         pool = std::make_unique<ThreadPool>(p.num_threads);
@@ -689,7 +799,79 @@ if (pool) {
             << counts.D << ","
             << std::fixed << std::setprecision(6) << beta_eff << ","
             << "0x" << std::hex << std::setw(16) << std::setfill('0') << checksum << std::dec << "\n";
+
+        // C1: Background snapshot writer
+
+        if (p.snapshot_interval > 0 &&
+            (day + 1) % p.snapshot_interval == 0) {
+
+            int snapshotDay = day + 1;
+
+            std::string filename = snapshotFilename(
+                p.snapshot_prefix, snapshotDay
+            );
+
+            if (!p.async_snapshots) {
+
+                // Blocking snapshot
+                if (!writePPM(
+                    cur, N, filename, p.io_latency_ms
+                )) {
+                    std::cerr << "Snapshot failed: "
+                              << filename << "\n";
+                }
+
+            } else {
+
+                // Wait for oldest write if Q writes are pending
+                if (pendingSnapshots.size() >=
+                    static_cast<size_t>(p.snapshot_limit)) {
+
+                    auto oldest = std::move(
+                        pendingSnapshots.front()
+                    );
+
+                    pendingSnapshots.pop_front();
+
+                    if (!oldest.second.get()) {
+                        std::cerr << "Snapshot failed on day "
+                                  << oldest.first << "\n";
+                    }
+                }
+
+                // Copy current grid before submitting async task
+                std::vector<Cell> snapshot = cur;
+
+                auto future = std::async(
+                    std::launch::async,
+                    [snapshot = std::move(snapshot),
+                     N, filename,
+                     latency = p.io_latency_ms]() {
+
+                        return writePPM(
+                            snapshot, N, filename, latency
+                        );
+                    }
+                );
+
+                pendingSnapshots.emplace_back(
+                    snapshotDay, std::move(future)
+                );
+            }
+        }
+
     }
+    // Wait for all remaining asynchronous snapshot writes
+while (!pendingSnapshots.empty()) {
+
+    auto task = std::move(pendingSnapshots.front());
+    pendingSnapshots.pop_front();
+
+    if (!task.second.get()) {
+        std::cerr << "Snapshot failed on day "
+                  << task.first << "\n";
+    }
+}
 
     csv.close();
     std::cout << "Simulation completed. Results written to " << p.output_file << "\n";
