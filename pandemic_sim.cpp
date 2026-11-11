@@ -84,6 +84,7 @@ struct Params
     std::string partition = "strips";
     bool run_sweep = false;
     bool benchmark_mode = false;
+    bool sequential_mode = false;
     std::vector<double> sweep_betas = {0.05, 0.08, 0.10};
     std::vector<double> sweep_vaccinations = {0.0, 0.2, 0.4};
     std::vector<uint64_t> sweep_seeds = {42, 43, 44};
@@ -938,7 +939,8 @@ void printHelp(const char *prog)
               << "  --sweep-workers <int>         Concurrent runs\n"
               << "  --time-limit <seconds>       Time limit\n"
               << "  --sweep-output <file>         Results CSV\n"
-              << "  --benchmark                   Disable CSV/checksum output and time simulation\n";
+              << "  --benchmark                   Disable CSV/checksum output and time simulation\n"
+              << "  --sequential                  Run without creating threads\n";
 }
 
 std::vector<double> parseDoubleList(const std::string &input)
@@ -1137,10 +1139,14 @@ Params parseArgs(int argc, char *argv[])
         else if (arg == "--sweep-output" && i + 1 < argc)
         {
             p.sweep_output = argv[++i];
-        } 
-        else if (arg == "--benchmark") 
+        }
+        else if (arg == "--benchmark")
         {
             p.benchmark_mode = true;
+        }
+        else if (arg == "--sequential")
+        {
+            p.sequential_mode = true;
         }
         else if (arg == "--fixed-days")
         {
@@ -1236,17 +1242,19 @@ int main(int argc, char *argv[])
     // Open output CSV
     std::ofstream csv;
 
-if (!p.benchmark_mode) {
-    csv.open(p.output_file);
+    if (!p.benchmark_mode)
+    {
+        csv.open(p.output_file);
 
-    if (!csv.is_open()) {
-        std::cerr << "Error: Could not open output file "
-                  << p.output_file << "\n";
-        return 1;
+        if (!csv.is_open())
+        {
+            std::cerr << "Error: Could not open output file "
+                      << p.output_file << "\n";
+            return 1;
+        }
+
+        csv << "day,S,I,R,V,D,beta_eff,checksum\n";
     }
-
-    csv << "day,S,I,R,V,D,beta_eff,checksum\n";
-}
     // Initial counts for day 0
     Counts counts;
     for (long long idx = 0; idx < total_cells; ++idx)
@@ -1275,27 +1283,28 @@ if (!p.benchmark_mode) {
     double beta_eff = p.beta * p.m;
     uint64_t checksum = 0;
 
-if (!p.benchmark_mode) {
+    if (!p.benchmark_mode)
+    {
 
-    checksum = computeGridChecksum(cur);
+        checksum = computeGridChecksum(cur);
 
-    csv << "0,"
-        << counts.S << ","
-        << counts.I << ","
-        << counts.R << ","
-        << counts.V << ","
-        << counts.D << ","
-        << std::fixed << std::setprecision(6) << beta_eff << ","
-        << "0x" << std::hex << std::setw(16)
-        << std::setfill('0') << checksum << std::dec << "\n";
-}
+        csv << "0,"
+            << counts.S << ","
+            << counts.I << ","
+            << counts.R << ","
+            << counts.V << ","
+            << counts.D << ","
+            << std::fixed << std::setprecision(6) << beta_eff << ","
+            << "0x" << std::hex << std::setw(16)
+            << std::setfill('0') << checksum << std::dec << "\n";
+    }
     // Precompute P[k] table for current beta_eff
     // Moore neighborhood offsets
 
     std::unique_ptr<ThreadPool> pool;
     std::deque<std::pair<int, std::future<bool>>> pendingSnapshots;
 
-    if (p.use_thread_pool)
+    if (p.use_thread_pool && !p.sequential_mode)
     {
         pool = std::make_unique<ThreadPool>(p.num_threads);
     }
@@ -1447,7 +1456,15 @@ if (!p.benchmark_mode) {
         // Execute generated regions
         next_counts = Counts{};
 
-        if (pool)
+        if (p.sequential_mode)
+        {
+
+            next_counts = updateRegion(
+                cur, next,
+                Region{0, N, 0, N, 1},
+                N, day, P, p);
+        }
+        else if (pool)
         {
 
             // B2: Thread pool
@@ -1517,20 +1534,21 @@ if (!p.benchmark_mode) {
         counts = next_counts;
 
         // Compute checksum of the newly updated grid
-        if (!p.benchmark_mode) {
+        if (!p.benchmark_mode)
+        {
 
-    checksum = computeGridChecksum(cur);
+            checksum = computeGridChecksum(cur);
 
-    csv << (day + 1) << ","
-        << counts.S << ","
-        << counts.I << ","
-        << counts.R << ","
-        << counts.V << ","
-        << counts.D << ","
-        << std::fixed << std::setprecision(6) << beta_eff << ","
-        << "0x" << std::hex << std::setw(16)
-        << std::setfill('0') << checksum << std::dec << "\n";
-}
+            csv << (day + 1) << ","
+                << counts.S << ","
+                << counts.I << ","
+                << counts.R << ","
+                << counts.V << ","
+                << counts.D << ","
+                << std::fixed << std::setprecision(6) << beta_eff << ","
+                << "0x" << std::hex << std::setw(16)
+                << std::setfill('0') << checksum << std::dec << "\n";
+        }
         // C1: Background snapshot writer
 
         if (p.snapshot_interval > 0 &&
@@ -1607,20 +1625,22 @@ if (!p.benchmark_mode) {
 
     auto simulationEnd = std::chrono::steady_clock::now();
 
-double simulationSeconds =
-    std::chrono::duration<double>(
-        simulationEnd - simulationStart
-    ).count();
+    double simulationSeconds =
+        std::chrono::duration<double>(
+            simulationEnd - simulationStart)
+            .count();
 
-if (p.benchmark_mode) {
-    std::cout << std::fixed << std::setprecision(6)
-              << "Simulation loop time: "
-              << simulationSeconds << " seconds\n";
-}
+    if (p.benchmark_mode)
+    {
+        std::cout << std::fixed << std::setprecision(6)
+                  << "Simulation loop time: "
+                  << simulationSeconds << " seconds\n";
+    }
 
-    if (!p.benchmark_mode) {
-    csv.close();
-}
+    if (!p.benchmark_mode)
+    {
+        csv.close();
+    }
     std::cout << "Simulation completed. Results written to " << p.output_file << "\n";
     return 0;
 }
