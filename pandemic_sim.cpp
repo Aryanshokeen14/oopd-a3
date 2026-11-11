@@ -43,6 +43,13 @@ struct Counts {
     long long D = 0;
 };
 
+struct Region {
+    int rowStart;
+    int rowEnd;
+    int colStart;
+    int colEnd;
+};
+
 // Simulation Parameters
 struct Params {
     int N = 1000;               // Grid size N x N
@@ -195,11 +202,11 @@ uint64_t computeGridChecksum(const std::vector<Cell>& grid) {
 }
 
 
-Counts updateChunk(
+
+Counts updateRegion(
     const std::vector<Cell>& cur,
     std::vector<Cell>& next,
-    int startRow,
-    int endRow,
+    const Region& region,
     int N,
     int day,
     const double P[9],
@@ -207,13 +214,13 @@ Counts updateChunk(
 ) {
     Counts localCounts;
 
-    const int di[8] = {-1, -1, -1, 0, 0, 1, 1, 1};
-    const int dj[8] = {-1, 0, 1, -1, 1, -1, 0, 1};
+    const int di[8] = {-1,-1,-1,0,0,1,1,1};
+    const int dj[8] = {-1,0,1,-1,1,-1,0,1};
 
-    for (int i = startRow; i < endRow; ++i) {
-        for (int j = 0; j < N; ++j) {
+    for (int i = region.rowStart; i < region.rowEnd; ++i) {
+        for (int j = region.colStart; j < region.colEnd; ++j) {
 
-            long long id = static_cast<long long>(i) * N + j;
+            long long id = 1LL * i * N + j;
             const Cell& cell = cur[id];
 
             if (cell.state == STATE_S) {
@@ -225,22 +232,17 @@ Counts updateChunk(
                     int nj = j + dj[dir];
 
                     if (ni >= 0 && ni < N &&
-                        nj >= 0 && nj < N) {
-
-                        if (cur[static_cast<long long>(ni) * N + nj].state == STATE_I) {
-                            k++;
-                        }
+                        nj >= 0 && nj < N &&
+                        cur[1LL * ni * N + nj].state == STATE_I) {
+                        k++;
                     }
                 }
 
                 if (k > 0 &&
                     rand01(p.seed, day, id, 0) < P[k]) {
-
                     next[id] = {STATE_I, 0};
                     localCounts.I++;
-
                 } else {
-
                     next[id] = {STATE_S, 0};
                     localCounts.S++;
                 }
@@ -258,12 +260,10 @@ Counts updateChunk(
                     }
 
                 } else {
-
                     next[id] = {
                         STATE_I,
                         static_cast<uint8_t>(cell.c + 1)
                     };
-
                     localCounts.I++;
                 }
 
@@ -279,6 +279,25 @@ Counts updateChunk(
     }
 
     return localCounts;
+}
+
+
+// Keep this wrapper for existing B1 and B2 code
+Counts updateChunk(
+    const std::vector<Cell>& cur,
+    std::vector<Cell>& next,
+    int startRow,
+    int endRow,
+    int N,
+    int day,
+    const double P[9],
+    const Params& p
+) {
+    Region region{startRow, endRow, 0, N};
+
+    return updateRegion(
+        cur, next, region, N, day, P, p
+    );
 }
 
 void printHelp(const char* prog) {
