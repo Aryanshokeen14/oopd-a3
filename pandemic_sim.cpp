@@ -48,6 +48,7 @@ struct Region {
     int rowEnd;
     int colStart;
     int colEnd;
+    int rowStride = 1;
 };
 
 // Simulation Parameters
@@ -218,7 +219,9 @@ Counts updateRegion(
     const int di[8] = {-1,-1,-1,0,0,1,1,1};
     const int dj[8] = {-1,0,1,-1,1,-1,0,1};
 
-    for (int i = region.rowStart; i < region.rowEnd; ++i) {
+    for (int i = region.rowStart;
+     i < region.rowEnd;
+     i += region.rowStride){
         for (int j = region.colStart; j < region.colEnd; ++j) {
 
             long long id = 1LL * i * N + j;
@@ -325,7 +328,7 @@ void printHelp(const char* prog) {
               << "  -o, --output <file>           Output CSV filename (default: output.csv)\n"
               << "  -h, --help                    Show this help message\n"
               << "  --pool                       Use reusable thread pool\n"
-              << "  --partition <type>    strips or blocks\n";
+              << "  --partition <type>    strips, blocks or interleaved\n";
 }
 
 Params parseArgs(int argc, char* argv[]) {
@@ -567,11 +570,42 @@ if (p.partition == "strips") {
         rowStart = rowEnd;
     }
 
+} else if (p.partition == "interleaved") {
+
+    // B3.3: Interleaved rows
+    int T = p.num_threads;
+
+    if (T <= 0 || C < T) {
+        throw std::invalid_argument(
+            "Interleaved partition requires C >= T > 0"
+        );
+    }
+
+    for (int chunk = 0; chunk < C; ++chunk) {
+
+        int lane = chunk % T;
+        int subtask = chunk / T;
+
+        int tasksForLane = 1 + (C - 1 - lane) / T;
+
+        int rowStart = lane + subtask * T;
+        int stride = T * tasksForLane;
+
+        regions.push_back({
+            rowStart,
+            N,
+            0,
+            N,
+            stride
+        });
+    }
+
 } else {
     throw std::invalid_argument(
-        "Unknown partition. Use strips or blocks."
+        "Unknown partition. Use strips, blocks or interleaved."
     );
 }
+
 
 
 // Execute generated regions
